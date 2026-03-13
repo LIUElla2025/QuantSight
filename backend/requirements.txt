@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+tigeropen
+python-dotenv
+numpy
+pandas
+openai
