@@ -7,6 +7,7 @@ import pandas as pd
 import logging
 from strategies import BaseStrategy, Signal, TradeSignal, MultiFactorStrategy
 from sentiment import analyze_market_sentiment, SentimentResult
+from news_fetcher import get_news_fetcher
 
 logger = logging.getLogger(__name__)
 
@@ -57,13 +58,24 @@ class LLMSentimentStrategy(BaseStrategy):
         tech_signal = self._multi_factor.generate_signal(df, symbol, position_qty)
 
         # Step 2: 情绪面分析（用 DeepSeek）
+        # 优先从参数获取新闻，否则从缓存读取（不阻塞交易循环）
         headlines = p.get("headlines", [])
-        sentiment = None
+        if not headlines:
+            fetcher = get_news_fetcher()
+            if fetcher:
+                headlines = fetcher.get_cached_headlines(symbol, max_count=10)
 
+        sentiment = None
         if headlines:
             try:
-                sentiment = analyze_market_sentiment(symbol, headlines)
+                # 限时5秒，防止DeepSeek慢响应阻塞整个交易信号循环
+                from concurrent.futures import ThreadPoolExecutor, TimeoutError
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(analyze_market_sentiment, symbol, headlines)
+                    sentiment = future.result(timeout=5)
                 logger.info(f"[{symbol}] LLM情绪分析: score={sentiment.score}, rec={sentiment.recommendation}")
+            except TimeoutError:
+                logger.warning(f"[{symbol}] LLM情绪分析超时(5s)，跳过情绪面")
             except Exception as e:
                 logger.warning(f"[{symbol}] LLM情绪分析失败: {e}")
 

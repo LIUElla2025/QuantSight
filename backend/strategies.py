@@ -49,19 +49,40 @@ class BaseStrategy:
         }
 
 
+def _calc_rsi_wilder(prices: pd.Series, period: int) -> pd.Series:
+    """Wilder 平滑法 RSI（标准实现，比 rolling().mean() 更准确）"""
+    delta = prices.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    # 修正：填充NaN为50（中性值），避免NaN传播到下游计算
+    return rsi.fillna(50.0)
+
+
+def _calc_atr_series(df: pd.DataFrame, period: int) -> float:
+    """计算 ATR（平均真实波幅）"""
+    high, low, prev_close = df["high"], df["low"], df["close"].shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return float(tr.rolling(period).mean().iloc[-1])
+
+
 class MACrossStrategy(BaseStrategy):
     """
-    均线交叉策略（双均线金叉/死叉）
-    - 短期均线上穿长期均线 → 买入
-    - 短期均线下穿长期均线 → 卖出
-    经典趋势跟踪策略，适合中长线
+    均线交叉策略（双均线金叉/死叉）+ 成交量确认 + ATR止损
+    - 短期均线金叉长期均线 + 量比 > 1.2 → 买入
+    - 短期均线死叉长期均线 → 卖出
+    - ATR动态止损替代固定百分比，适应市场波动
     """
 
     name = "MA交叉策略"
-    description = "双均线金叉买入、死叉卖出，经典趋势跟踪"
+    description = "双均线金叉+量价确认买入，ATR动态止损"
 
     def __init__(self, params: dict = None):
-        defaults = {"short_period": 5, "long_period": 20, "quantity": 100}
+        defaults = {"short_period": 5, "long_period": 20, "atr_period": 14,
+                    "atr_stop_mult": 2.0, "quantity": 100}
         super().__init__({**defaults, **(params or {})})
 
     def generate_signal(self, df: pd.DataFrame, symbol: str, position_qty: int = 0) -> TradeSignal:
@@ -69,12 +90,12 @@ class MACrossStrategy(BaseStrategy):
         long_ = self.params["long_period"]
         qty = self.params["quantity"]
 
+        if len(df) < long_ + 1:
+            return TradeSignal(Signal.HOLD, symbol, df["close"].iloc[-1], 0, "数据不足")
+
         df = df.copy()
         df["ma_short"] = df["close"].rolling(window=short).mean()
         df["ma_long"] = df["close"].rolling(window=long_).mean()
-
-        if len(df) < long_ + 1:
-            return TradeSignal(Signal.HOLD, symbol, df["close"].iloc[-1], 0, "数据不足")
 
         curr_short = df["ma_short"].iloc[-1]
         curr_long = df["ma_long"].iloc[-1]
@@ -82,16 +103,31 @@ class MACrossStrategy(BaseStrategy):
         prev_long = df["ma_long"].iloc[-2]
         price = df["close"].iloc[-1]
 
-        # 金叉：短期均线从下方穿越长期均线
-        if prev_short <= prev_long and curr_short > curr_long and position_qty == 0:
+        # 成交量确认：当前成交量需高于近期均量
+        vol_ok = True
+        vol_info = ""
+        if "volume" in df.columns:
+            # 修正：off-by-one，排除当前bar，用前long_个bar的均量
+            avg_vol = df["volume"].iloc[-(long_ + 1):-1].mean()
+            curr_vol = df["volume"].iloc[-1]
+            vol_ratio = curr_vol / avg_vol if avg_vol > 0 else 1.0
+            vol_ok = vol_ratio >= 1.2
+            vol_info = f"，量比{vol_ratio:.1f}"
+
+        # ATR动态止损
+        atr = _calc_atr_series(df, self.params["atr_period"])
+
+        # 金叉买入（需量价配合）
+        if prev_short <= prev_long and curr_short > curr_long and position_qty == 0 and vol_ok:
+            stop_loss = price - atr * self.params["atr_stop_mult"]
             return TradeSignal(
                 Signal.BUY, symbol, price, qty,
-                f"MA{short}金叉MA{long_}，短均线{curr_short:.2f}>长均线{curr_long:.2f}",
-                stop_loss=price * 0.95,
-                take_profit=price * 1.15,
+                f"MA{short}金叉MA{long_}{vol_info}，止损{stop_loss:.2f}(ATR={atr:.2f})",
+                stop_loss=stop_loss,
+                take_profit=price + atr * self.params["atr_stop_mult"] * 2.5,
             )
 
-        # 死叉：短期均线从上方穿越长期均线
+        # 死叉卖出
         if prev_short >= prev_long and curr_short < curr_long and position_qty > 0:
             return TradeSignal(
                 Signal.SELL, symbol, price, position_qty,
@@ -113,17 +149,9 @@ class RSIStrategy(BaseStrategy):
     description = "RSI超卖买入、超买卖出，适合震荡行情"
 
     def __init__(self, params: dict = None):
-        defaults = {"period": 14, "oversold": 30, "overbought": 70, "quantity": 100}
+        defaults = {"period": 14, "oversold": 30, "overbought": 70,
+                    "trend_period": 50, "quantity": 100}
         super().__init__({**defaults, **(params or {})})
-
-    def _calc_rsi(self, prices: pd.Series, period: int) -> pd.Series:
-        delta = prices.diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = -delta.where(delta < 0, 0.0)
-        avg_gain = gain.rolling(window=period).mean()
-        avg_loss = loss.rolling(window=period).mean()
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
 
     def generate_signal(self, df: pd.DataFrame, symbol: str, position_qty: int = 0) -> TradeSignal:
         period = self.params["period"]
@@ -131,20 +159,32 @@ class RSIStrategy(BaseStrategy):
         overbought = self.params["overbought"]
         qty = self.params["quantity"]
         price = df["close"].iloc[-1]
+        trend_period = self.params.get("trend_period", 50)
 
-        if len(df) < period + 1:
+        if len(df) < max(period + 1, trend_period):
             return TradeSignal(Signal.HOLD, symbol, price, 0, "数据不足")
 
-        rsi = self._calc_rsi(df["close"], period)
-        curr_rsi = rsi.iloc[-1]
+        # Wilder 法 RSI（修正：原 rolling().mean() 不准确）
+        rsi_series = _calc_rsi_wilder(df["close"], period)
+        curr_rsi = float(rsi_series.iloc[-1])
 
-        if curr_rsi < oversold and position_qty == 0:
+        # 趋势过滤：RSI超卖但处于长期下行趋势时不买（避免价值陷阱）
+        trend_ma = df["close"].rolling(trend_period).mean()
+        in_uptrend = df["close"].iloc[-1] > trend_ma.iloc[-1]
+
+        atr = _calc_atr_series(df, period)
+
+        if curr_rsi < oversold and position_qty == 0 and in_uptrend:
             return TradeSignal(
                 Signal.BUY, symbol, price, qty,
-                f"RSI={curr_rsi:.1f}<{oversold}超卖，反弹买入",
-                stop_loss=price * 0.93,
-                take_profit=price * 1.10,
+                f"RSI={curr_rsi:.1f}<{oversold}超卖+长期趋势向上，反弹买入",
+                stop_loss=price - atr * 2.0,
+                take_profit=price + atr * 3.0,
             )
+
+        if curr_rsi < oversold and position_qty == 0 and not in_uptrend:
+            return TradeSignal(Signal.HOLD, symbol, price, 0,
+                               f"RSI={curr_rsi:.1f}超卖但趋势向下，跳过避免价值陷阱")
 
         if curr_rsi > overbought and position_qty > 0:
             return TradeSignal(
@@ -152,7 +192,9 @@ class RSIStrategy(BaseStrategy):
                 f"RSI={curr_rsi:.1f}>{overbought}超买，获利卖出",
             )
 
-        return TradeSignal(Signal.HOLD, symbol, price, 0, f"RSI={curr_rsi:.1f}，处于中间区域，观望")
+        trend_str = "上行" if in_uptrend else "下行"
+        return TradeSignal(Signal.HOLD, symbol, price, 0,
+                           f"RSI={curr_rsi:.1f}，趋势{trend_str}，观望")
 
 
 class BollingerBandStrategy(BaseStrategy):
@@ -332,16 +374,6 @@ class MultiFactorStrategy(BaseStrategy):
         }
         super().__init__({**defaults, **(params or {})})
 
-    def _calc_rsi(self, prices: pd.Series, period: int) -> float:
-        delta = prices.diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = -delta.where(delta < 0, 0.0)
-        avg_gain = gain.rolling(window=period).mean()
-        avg_loss = loss.rolling(window=period).mean()
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        return float(rsi.iloc[-1])
-
     def generate_signal(self, df: pd.DataFrame, symbol: str, position_qty: int = 0) -> TradeSignal:
         p = self.params
         price = df["close"].iloc[-1]
@@ -351,21 +383,21 @@ class MultiFactorStrategy(BaseStrategy):
             return TradeSignal(Signal.HOLD, symbol, price, 0, "数据不足")
 
         df = df.copy()
-        buy_votes = 0
-        sell_votes = 0
+        buy_score = 0.0
+        sell_score = 0.0
         reasons_buy = []
         reasons_sell = []
 
-        # ── 因子1: RSI ──
-        rsi = self._calc_rsi(df["close"], p["rsi_period"])
+        # ── 因子1: RSI（权重1.5，Wilder法修正）──
+        rsi = float(_calc_rsi_wilder(df["close"], p["rsi_period"]).iloc[-1])
         if rsi < p["rsi_oversold"]:
-            buy_votes += 1
+            buy_score += 1.5
             reasons_buy.append(f"RSI={rsi:.0f}超卖")
         elif rsi > p["rsi_overbought"]:
-            sell_votes += 1
+            sell_score += 1.5
             reasons_sell.append(f"RSI={rsi:.0f}超买")
 
-        # ── 因子2: MACD ──
+        # ── 因子2: MACD（权重1.5，趋势指标更重要）──
         df["ema_f"] = df["close"].ewm(span=p["macd_fast"], adjust=False).mean()
         df["ema_s"] = df["close"].ewm(span=p["macd_slow"], adjust=False).mean()
         df["dif"] = df["ema_f"] - df["ema_s"]
@@ -373,63 +405,79 @@ class MultiFactorStrategy(BaseStrategy):
         hist_curr = df["dif"].iloc[-1] - df["dea"].iloc[-1]
         hist_prev = df["dif"].iloc[-2] - df["dea"].iloc[-2]
         if hist_prev <= 0 and hist_curr > 0:
-            buy_votes += 1
+            buy_score += 1.5
             reasons_buy.append("MACD金叉")
         elif hist_prev >= 0 and hist_curr < 0:
-            sell_votes += 1
+            sell_score += 1.5
             reasons_sell.append("MACD死叉")
+        # MACD绝对方向（DIF > 0 为多头区域，权重0.5）
+        dif_curr = float(df["dif"].iloc[-1])
+        if dif_curr > 0:
+            buy_score += 0.5
+        else:
+            sell_score += 0.5
 
-        # ── 因子3: 布林带 ──
+        # ── 因子3: 布林带（权重1.0）──
         sma = df["close"].rolling(p["bb_period"]).mean()
         std = df["close"].rolling(p["bb_period"]).std()
         upper = sma + p["bb_std"] * std
         lower = sma - p["bb_std"] * std
         if price <= lower.iloc[-1]:
-            buy_votes += 1
+            buy_score += 1.0
             reasons_buy.append(f"触及布林下轨{lower.iloc[-1]:.2f}")
         elif price >= upper.iloc[-1]:
-            sell_votes += 1
+            sell_score += 1.0
             reasons_sell.append(f"突破布林上轨{upper.iloc[-1]:.2f}")
 
-        # ── 因子4: 均线 ──
+        # ── 因子4: 均线（权重1.0，金叉/死叉 + 排列方向）──
         ma_s = df["close"].rolling(p["ma_short"]).mean()
         ma_l = df["close"].rolling(p["ma_long"]).mean()
         if ma_s.iloc[-2] <= ma_l.iloc[-2] and ma_s.iloc[-1] > ma_l.iloc[-1]:
-            buy_votes += 1
+            buy_score += 1.0
             reasons_buy.append(f"MA{p['ma_short']}金叉MA{p['ma_long']}")
         elif ma_s.iloc[-2] >= ma_l.iloc[-2] and ma_s.iloc[-1] < ma_l.iloc[-1]:
-            sell_votes += 1
+            sell_score += 1.0
             reasons_sell.append(f"MA{p['ma_short']}死叉MA{p['ma_long']}")
+        # 均线排列方向（权重0.5）
+        if ma_s.iloc[-1] > ma_l.iloc[-1]:
+            buy_score += 0.5
+        else:
+            sell_score += 0.5
 
-        # ── 因子5: 成交量 ──
+        # ── 因子5: 成交量（权重1.0）──
         if "volume" in df.columns:
             avg_vol = df["volume"].iloc[-p["vol_lookback"] - 1:-1].mean()
             curr_vol = df["volume"].iloc[-1]
             if avg_vol > 0 and curr_vol > avg_vol * p["vol_ratio"]:
-                # 放量方向跟随价格方向
                 if df["close"].iloc[-1] > df["close"].iloc[-2]:
-                    buy_votes += 1
+                    buy_score += 1.0
                     reasons_buy.append(f"放量上涨(量比{curr_vol / avg_vol:.1f})")
                 else:
-                    sell_votes += 1
+                    sell_score += 1.0
                     reasons_sell.append(f"放量下跌(量比{curr_vol / avg_vol:.1f})")
 
-        # ── 投票决策 ──
-        if buy_votes >= p["buy_threshold"] and position_qty == 0:
-            reason = f"多因子看多({buy_votes}/5): " + ", ".join(reasons_buy)
+        # ATR动态止损
+        atr = _calc_atr_series(df, p.get("atr_period", 14))
+
+        # ── 加权评分决策（总权重最大~6.5，阈值可调）──
+        buy_thresh = p["buy_threshold"]   # 默认3
+        sell_thresh = p["sell_threshold"]  # 默认3
+
+        if buy_score >= buy_thresh and position_qty == 0:
+            reason = f"多因子看多(得分{buy_score:.1f}): " + ", ".join(reasons_buy)
             return TradeSignal(
                 Signal.BUY, symbol, price, p["quantity"], reason,
-                stop_loss=price * (1 - p["stop_loss_pct"]),
-                take_profit=price * (1 + p["take_profit_pct"]),
+                stop_loss=price - atr * 2.0,
+                take_profit=price + atr * 4.0,
             )
 
-        if sell_votes >= p["sell_threshold"] and position_qty > 0:
-            reason = f"多因子看空({sell_votes}/5): " + ", ".join(reasons_sell)
+        if sell_score >= sell_thresh and position_qty > 0:
+            reason = f"多因子看空(得分{sell_score:.1f}): " + ", ".join(reasons_sell)
             return TradeSignal(Signal.SELL, symbol, price, position_qty, reason)
 
         return TradeSignal(
             Signal.HOLD, symbol, price, 0,
-            f"因子投票: 看多{buy_votes}/5, 看空{sell_votes}/5, 未达阈值"
+            f"加权评分: 看多{buy_score:.1f}, 看空{sell_score:.1f}, 未达阈值"
         )
 
 
@@ -558,17 +606,6 @@ class MeanReversionStrategy(BaseStrategy):
         super().__init__({**defaults, **(params or {})})
         self._entry_bar = 0
 
-    def _calc_rsi(self, prices: pd.Series, period: int) -> float:
-        delta = prices.diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = -delta.where(delta < 0, 0.0)
-        avg_gain = gain.rolling(window=period).mean()
-        avg_loss = loss.rolling(window=period).mean()
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        val = rsi.iloc[-1]
-        return float(val) if not np.isnan(val) else 50.0
-
     def generate_signal(self, df: pd.DataFrame, symbol: str, position_qty: int = 0) -> TradeSignal:
         p = self.params
         price = df["close"].iloc[-1]
@@ -579,7 +616,8 @@ class MeanReversionStrategy(BaseStrategy):
 
         # 短期收益率
         recent_return = (price - df["close"].iloc[-lookback - 1]) / df["close"].iloc[-lookback - 1]
-        rsi = self._calc_rsi(df["close"], p["rsi_period"])
+        rsi_val = _calc_rsi_wilder(df["close"], p["rsi_period"]).iloc[-1]
+        rsi = float(rsi_val) if not np.isnan(rsi_val) else 50.0
 
         # ── 买入：短期大跌 + RSI超卖 → 反弹买入 ──
         if (recent_return < p["deviation_threshold"] and rsi < p["rsi_oversold"]
@@ -637,8 +675,28 @@ STRATEGY_REGISTRY = {
 }
 
 
-def _register_llm_strategy():
-    """延迟注册LLM策略，避免启动时import报错（openai可能未安装）"""
+def _register_advanced_strategies():
+    """注册高级策略（延迟导入避免循环依赖）"""
+    if "regime_adaptive" not in STRATEGY_REGISTRY:
+        try:
+            from advanced_strategies import (
+                RegimeAdaptiveStrategy,
+                MomentumVolatilityStrategy,
+                StatArbPairsStrategy,
+            )
+            STRATEGY_REGISTRY["regime_adaptive"] = RegimeAdaptiveStrategy
+            STRATEGY_REGISTRY["momentum_volatility"] = MomentumVolatilityStrategy
+            STRATEGY_REGISTRY["stat_arb_pairs"] = StatArbPairsStrategy
+        except ImportError:
+            pass
+
+    if "super_alpha" not in STRATEGY_REGISTRY:
+        try:
+            from super_strategy import SuperAlphaStrategy
+            STRATEGY_REGISTRY["super_alpha"] = SuperAlphaStrategy
+        except ImportError:
+            pass
+
     if "llm_sentiment" not in STRATEGY_REGISTRY:
         try:
             from news_strategy import LLMSentimentStrategy
@@ -646,10 +704,40 @@ def _register_llm_strategy():
         except ImportError:
             pass
 
+    # 日内策略
+    if "intraday_momentum" not in STRATEGY_REGISTRY:
+        try:
+            from intraday_strategies import (
+                IntradayMomentumStrategy,
+                OpeningRangeBreakoutStrategy,
+                VWAPReversionStrategy,
+                EndOfDayMOCStrategy,
+                Last30MinStatStrategy,
+            )
+            STRATEGY_REGISTRY["intraday_momentum"] = IntradayMomentumStrategy
+            STRATEGY_REGISTRY["orb"] = OpeningRangeBreakoutStrategy
+            STRATEGY_REGISTRY["vwap_reversion"] = VWAPReversionStrategy
+            STRATEGY_REGISTRY["eod_moc"] = EndOfDayMOCStrategy
+            STRATEGY_REGISTRY["last_30min"] = Last30MinStatStrategy
+        except ImportError:
+            pass
+
+    # 事件驱动策略
+    if "pead" not in STRATEGY_REGISTRY:
+        try:
+            from event_driven import (
+                PostEarningsDriftStrategy,
+                IndexRebalanceStrategy,
+            )
+            STRATEGY_REGISTRY["pead"] = PostEarningsDriftStrategy
+            STRATEGY_REGISTRY["index_rebalance"] = IndexRebalanceStrategy
+        except ImportError:
+            pass
+
 
 def get_strategy(name: str, params: dict = None) -> BaseStrategy:
-    _register_llm_strategy()
     """根据名称获取策略实例"""
+    _register_advanced_strategies()
     if name not in STRATEGY_REGISTRY:
         raise ValueError(f"未知策略: {name}，可用策略: {list(STRATEGY_REGISTRY.keys())}")
     return STRATEGY_REGISTRY[name](params)
@@ -657,7 +745,7 @@ def get_strategy(name: str, params: dict = None) -> BaseStrategy:
 
 def list_strategies() -> list:
     """列出所有可用策略"""
-    _register_llm_strategy()
+    _register_advanced_strategies()
     return [
         {"key": key, "name": cls.name, "description": cls.description}
         for key, cls in STRATEGY_REGISTRY.items()
