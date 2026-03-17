@@ -11,6 +11,14 @@ venv/
 node_modules/
 dist/
 
+# Trading state (contains positions/PnL, do not commit)
+engine_state.json
+*.tmp
+
+# Logs
+logs/
+*.log
+
 # IDE
 .vscode/
 .idea/

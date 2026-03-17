@@ -600,7 +600,16 @@ class StrategyEngine:
             kelly_budget = equity * kelly_pct * cvs_scale
             cash_budget = cash / running_count * 0.9  # 留10%安全余量
 
-            budget = min(kelly_budget, cash_budget)
+            # 小资金账户（<30K HKD）：Kelly比例太小会导致预算低于最小下单额
+            # 直接用现金预算，跳过Kelly限制，保证能下单
+            if equity < 30000:
+                budget = cash_budget
+                logger.info(
+                    f"[{inst.strategy_name}] 小资金模式: 跳过Kelly限制, "
+                    f"预算={budget:.0f}HKD (Kelly预算={kelly_budget:.0f}太小)"
+                )
+            else:
+                budget = min(kelly_budget, cash_budget)
             affordable_qty = int(budget / signal.price) if signal.price > 0 else 0
 
             if affordable_qty <= 0:

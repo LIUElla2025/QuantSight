@@ -12,6 +12,7 @@ import os
 import secrets
 import pandas as pd
 import logging
+import logging.handlers
 
 # 老虎证券 OpenAPI
 from tigeropen.trade.trade_client import TradeClient
@@ -32,7 +33,23 @@ from sentiment import analyze_sentiment, analyze_market_sentiment, analyze_earni
 from news_fetcher import init_news_fetcher, get_news_fetcher
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+
+# 日志：同时输出到 console 和文件（实盘交易必须有持久日志）
+_log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
+os.makedirs(_log_dir, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(
+            os.path.join(_log_dir, "quantsight.log"),
+            maxBytes=10_000_000,  # 10MB per file
+            backupCount=5,
+            encoding="utf-8",
+        ),
+    ],
+)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="QuantSight - 量化交易自动化平台")
@@ -580,7 +597,40 @@ def auto_trade_start(top_n: int = 2):
             strategy_engine.remove_strategy(iid)
 
         # ── 动态选股：按流动性从备选池筛选最优标的 ──
-        targets = _screen_hk_stocks(top_n=top_n)
+        # 小资金需要更多候选，因为很多1手价超预算会被过滤
+        fetch_n = top_n * 5 if cash < 30000 else top_n
+        raw_targets = _screen_hk_stocks(top_n=fetch_n)
+
+        # 小资金过滤：只保留单手价在预算内的标的
+        per_stock_budget = cash / max(top_n, 1) * 0.9 if cash > 0 else 5000
+        targets = []
+        for t in raw_targets:
+            sym = t["symbol"]
+            lot = strategy_engine._get_hk_lot_size(sym)
+            # 用候选池中的价格估算（如果有的话），否则跳过检查
+            est_price = t.get("amount", 0) / max(t.get("_score", 1), 1) if t.get("_score") else 0
+            if cash > 0 and cash < 30000 and est_price == 0:
+                # 无法估价时，用Tiger API快速查价
+                try:
+                    qc = get_quote_client()
+                    briefs = qc.get_stock_briefs([sym])
+                    if briefs is not None and len(briefs) > 0 and hasattr(briefs, 'iloc'):
+                        est_price = float(briefs.iloc[0].get('latest_price', 0) or 0)
+                except Exception:
+                    pass
+            lot_cost = est_price * lot if est_price > 0 else 0
+            if lot_cost > 0 and lot_cost > per_stock_budget:
+                logger.info(f"选股过滤: {t['name']}({sym}) 1手={lot_cost:.0f}HKD > 预算{per_stock_budget:.0f}HKD，跳过")
+                continue
+            targets.append(t)
+            if len(targets) >= top_n:
+                break
+
+        if not targets:
+            return {
+                "success": False,
+                "error": f"账户余额 HKD {cash:.0f} 不足以买入任何候选股的最小1手，请充值"
+            }
 
         created = []
         subscribed_symbols = []
@@ -1134,4 +1184,4 @@ def startup():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
