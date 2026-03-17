@@ -6,6 +6,8 @@
 import threading
 import uuid
 import logging
+import json
+import os
 from datetime import datetime, time as dtime, timezone, timedelta
 from typing import Optional
 from dataclasses import dataclass, field
@@ -136,8 +138,11 @@ class StrategyInstance:
         }
 
 
+STATE_FILE = os.path.join(os.path.dirname(__file__), "engine_state.json")
+
+
 class StrategyEngine:
-    """策略执行引擎 v2.0（单例）"""
+    """策略执行引擎 v3.1（单例）— 新增状态持久化"""
 
     def __init__(self):
         self.instances: dict[str, StrategyInstance] = {}
@@ -154,6 +159,9 @@ class StrategyEngine:
         self._daily_loss_paused = False
         self._today_start_equity = 0.0
         self._today_date = ""
+        # 订单去重：记录最近下单时间，防止短时间内重复下单
+        self._last_order_time: dict[str, float] = {}  # instance_id -> timestamp
+        self._order_cooldown = 60  # 同一策略最少间隔60秒才能再次下单
 
     def set_quote_fetcher(self, fetcher):
         self._quote_fetcher = fetcher
@@ -600,7 +608,8 @@ class StrategyEngine:
                 return None
 
             # 最小仓位检查（避免下单金额过小，手续费占比过高）
-            min_order_value = 5000  # HKD 5000
+            # v3.1: 从5000降到2000，适配小资金账户（1万HKD跑1-2只）
+            min_order_value = 2000  # HKD 2000
             if budget < min_order_value:
                 inst.last_signal = f"仓位太小({budget:.0f}<{min_order_value}HKD)，跳过下单"
                 return None
@@ -886,7 +895,26 @@ class StrategyEngine:
                 inst.error_msg = f"紧急停止: {reason}"
         logger.critical(f"所有策略已紧急停止: {reason}")
 
+    def _check_order_cooldown(self, inst: StrategyInstance) -> bool:
+        """订单去重：检查是否在冷却期内，防止重复下单"""
+        import time
+        now = time.time()
+        last = self._last_order_time.get(inst.id, 0)
+        if now - last < self._order_cooldown:
+            logger.warning(
+                f"[{inst.strategy_name}@{inst.symbol}] 订单冷却中"
+                f"（距上次下单{now - last:.0f}秒<{self._order_cooldown}秒），跳过"
+            )
+            return False
+        self._last_order_time[inst.id] = now
+        return True
+
     def _execute_buy(self, inst: StrategyInstance, signal: TradeSignal):
+        # 订单去重检查
+        if not self._check_order_cooldown(inst):
+            inst.last_signal = f"HOLD: 订单冷却中，跳过买入（{signal.reason}）"
+            return
+
         trade_record = {
             "time": _hk_now().strftime("%Y-%m-%d %H:%M:%S"),
             "action": "BUY",
@@ -912,60 +940,191 @@ class StrategyEngine:
 
         # 只有下单成功（或无执行器时模拟）才更新仓位
         if not order_failed:
+            # 优先使用实际成交价，否则回退到信号价
+            actual_price = signal.price
+            if isinstance(trade_record.get("order_result"), dict):
+                fill = trade_record["order_result"].get("avg_fill_price")
+                if fill and fill > 0:
+                    actual_price = float(fill)
+                    logger.info(f"[{inst.strategy_name}] 使用实际成交价 {actual_price:.3f}（信号价 {signal.price:.3f}）")
             inst.position_qty = signal.quantity
-            inst.position_cost = signal.price
-            inst.highest_price_since_buy = signal.price  # 重置追踪止损
+            inst.position_cost = actual_price
+            inst.highest_price_since_buy = actual_price  # 重置追踪止损
         inst.total_trades += 1
         inst.trade_history.append(trade_record)
+        self.save_state()  # 持久化状态
         logger.info(f"[{inst.strategy_name}] 买入 {inst.symbol} {signal.quantity}股 @ {signal.price} {'(失败)' if order_failed else ''}")
 
     def _execute_sell(self, inst: StrategyInstance, signal: TradeSignal):
-        pnl = (signal.price - inst.position_cost) * inst.position_qty
         trade_record = {
             "time": _hk_now().strftime("%Y-%m-%d %H:%M:%S"),
             "action": "SELL",
             "price": signal.price,
             "quantity": inst.position_qty,
-            "pnl": round(pnl, 2),
+            "pnl": 0.0,  # 下单后用实际成交价重算
             "reason": signal.reason,
             "order_result": None,
         }
 
+        order_failed = False
         if self._order_executor:
             try:
                 result = self._order_executor(inst.symbol, "SELL", inst.position_qty, signal.price)
                 trade_record["order_result"] = result
+                if isinstance(result, dict) and result.get("error"):
+                    order_failed = True
+                    inst.error_msg = f"卖出下单失败: {result['error']}"
             except Exception as e:
                 trade_record["order_result"] = {"error": str(e)}
-                inst.error_msg = f"下单失败: {e}"
+                inst.error_msg = f"卖出下单失败: {e}"
+                order_failed = True
 
-        inst.realized_pnl += pnl
+        # 优先使用实际成交价计算 PnL
+        sell_price = signal.price
+        if isinstance(trade_record.get("order_result"), dict):
+            fill = trade_record["order_result"].get("avg_fill_price")
+            if fill and fill > 0:
+                sell_price = float(fill)
+                logger.info(f"[{inst.strategy_name}] 卖出实际成交价 {sell_price:.3f}（信号价 {signal.price:.3f}）")
+        pnl = (sell_price - inst.position_cost) * inst.position_qty
+        trade_record["pnl"] = round(pnl, 2)
 
-        # 更新今日盈亏（按香港时区自然日重置）
-        today = _hk_now().strftime("%Y-%m-%d")
-        if inst.last_trade_date != today:
-            inst.daily_pnl = 0.0
-        inst.daily_pnl += pnl
-        inst.last_trade_date = today
+        # 只有下单成功（或无执行器时模拟）才更新仓位
+        if not order_failed:
+            inst.realized_pnl += pnl
 
-        inst.position_qty = 0
-        inst.position_cost = 0.0
-        inst.unrealized_pnl = 0.0
-        inst.highest_price_since_buy = 0.0
+            # 更新今日盈亏（按香港时区自然日重置）
+            today = _hk_now().strftime("%Y-%m-%d")
+            if inst.last_trade_date != today:
+                inst.daily_pnl = 0.0
+            inst.daily_pnl += pnl
+            inst.last_trade_date = today
+
+            inst.position_qty = 0
+            inst.position_cost = 0.0
+            inst.unrealized_pnl = 0.0
+            inst.highest_price_since_buy = 0.0
+
+            # 更新连续亏损计数
+            if pnl > 0:
+                inst.consecutive_losses = 0
+            else:
+                inst.consecutive_losses += 1
+        else:
+            logger.error(
+                f"[{inst.strategy_name}] 卖出 {inst.symbol} 失败! 仓位保留 {inst.position_qty}股, "
+                f"下次循环将重试"
+            )
+
         inst.total_trades += 1
         inst.trade_history.append(trade_record)
-
-        # 更新连续亏损计数
-        if pnl > 0:
-            inst.consecutive_losses = 0
-        else:
-            inst.consecutive_losses += 1
+        self.save_state()  # 持久化状态
 
         logger.info(
             f"[{inst.strategy_name}] 卖出 {inst.symbol} @ {signal.price}, "
-            f"盈亏: {pnl:.2f}, 连续亏损: {inst.consecutive_losses}次"
+            f"盈亏: {pnl:.2f}, {'成功' if not order_failed else '失败-仓位保留'}"
         )
+
+    # ─── 状态持久化 ───────────────────────────────────
+
+    def save_state(self):
+        """将所有策略实例状态保存到 JSON 文件，防止重启丢失"""
+        try:
+            state = {
+                "saved_at": _hk_now().strftime("%Y-%m-%d %H:%M:%S"),
+                "emergency_stopped": self._emergency_stopped,
+                "instances": {},
+            }
+            for inst_id, inst in self.instances.items():
+                state["instances"][inst_id] = {
+                    "id": inst.id,
+                    "strategy_key": inst.strategy_key,
+                    "strategy_name": inst.strategy_name,
+                    "symbol": inst.symbol,
+                    "params": inst.params,
+                    "status": inst.status,
+                    "position_qty": inst.position_qty,
+                    "position_cost": inst.position_cost,
+                    "realized_pnl": inst.realized_pnl,
+                    "unrealized_pnl": inst.unrealized_pnl,
+                    "total_trades": inst.total_trades,
+                    "last_signal": inst.last_signal,
+                    "last_check": inst.last_check,
+                    "created_at": inst.created_at,
+                    "trade_history": inst.trade_history[-50:],  # 最近50笔
+                    "error_msg": inst.error_msg,
+                    "highest_price_since_buy": inst.highest_price_since_buy,
+                    "trailing_stop_pct": inst.trailing_stop_pct,
+                    "consecutive_losses": inst.consecutive_losses,
+                    "daily_pnl": inst.daily_pnl,
+                    "last_trade_date": inst.last_trade_date,
+                }
+            # 原子写入：先写临时文件再重命名，防止写一半崩溃
+            tmp_file = STATE_FILE + ".tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_file, STATE_FILE)
+        except Exception as e:
+            logger.error(f"保存引擎状态失败: {e}")
+
+    def load_state(self):
+        """从 JSON 文件恢复策略实例状态（仅恢复持仓数据，不自动启动策略）"""
+        if not os.path.exists(STATE_FILE):
+            logger.info("无历史状态文件，全新启动")
+            return
+
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+
+            self._emergency_stopped = state.get("emergency_stopped", False)
+            restored = 0
+            has_position = 0
+
+            for inst_id, data in state.get("instances", {}).items():
+                inst = StrategyInstance(
+                    id=data["id"],
+                    strategy_key=data["strategy_key"],
+                    strategy_name=data["strategy_name"],
+                    symbol=data["symbol"],
+                    params=data.get("params", {}),
+                    status="stopped",  # 恢复后默认停止，需手动启动
+                    position_qty=data.get("position_qty", 0),
+                    position_cost=data.get("position_cost", 0.0),
+                    realized_pnl=data.get("realized_pnl", 0.0),
+                    unrealized_pnl=data.get("unrealized_pnl", 0.0),
+                    total_trades=data.get("total_trades", 0),
+                    last_signal=data.get("last_signal"),
+                    last_check=data.get("last_check"),
+                    created_at=data.get("created_at", ""),
+                    trade_history=data.get("trade_history", []),
+                    error_msg=None,
+                    highest_price_since_buy=data.get("highest_price_since_buy", 0.0),
+                    trailing_stop_pct=data.get("trailing_stop_pct", 0.05),
+                    consecutive_losses=data.get("consecutive_losses", 0),
+                    daily_pnl=data.get("daily_pnl", 0.0),
+                    last_trade_date=data.get("last_trade_date", ""),
+                )
+                self.instances[inst_id] = inst
+                restored += 1
+                if inst.position_qty > 0:
+                    has_position += 1
+
+            saved_at = state.get("saved_at", "未知")
+            logger.info(
+                f"已恢复引擎状态（保存于{saved_at}）: "
+                f"{restored}个策略实例, {has_position}个有持仓"
+            )
+            if has_position > 0:
+                logger.warning(
+                    f"⚠️ 有{has_position}个策略有未平仓持仓! "
+                    f"请检查后手动启动策略或平仓"
+                )
+        except Exception as e:
+            logger.error(f"恢复引擎状态失败: {e}")
 
 
 # 全局单例
 engine = StrategyEngine()
+# 启动时恢复状态
+engine.load_state()

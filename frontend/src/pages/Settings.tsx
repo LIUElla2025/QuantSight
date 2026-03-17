@@ -6,6 +6,21 @@ export default function Settings() {
   const [apiStatus, setApiStatus] = useState<string>('未检测')
   const [checking, setChecking] = useState(false)
 
+  // API Key 认证
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem('quantsight_api_key') || '')
+  const [keySaved, setKeySaved] = useState(false)
+
+  const saveApiKey = () => {
+    const trimmed = apiKey.trim()
+    if (trimmed) {
+      localStorage.setItem('quantsight_api_key', trimmed)
+    } else {
+      localStorage.removeItem('quantsight_api_key')
+    }
+    setKeySaved(true)
+    setTimeout(() => setKeySaved(false), 2000)
+  }
+
   // LLM 情绪分析测试
   const [sentimentSymbol, setSentimentSymbol] = useState('AAPL')
   const [sentimentText, setSentimentText] = useState('')
@@ -70,6 +85,32 @@ export default function Settings() {
               {apiStatus}
             </span>
           </div>
+        </div>
+
+        {/* API Key 认证 */}
+        <div className="widget" style={{ borderColor: 'rgba(255, 61, 0, 0.3)' }}>
+          <div className="widget-title" style={{ color: 'var(--accent-red)' }}>交易接口认证</div>
+          <div className="settings-info">
+            <p>设置 API Key 后，所有交易操作（买卖、启停策略）需要携带此密钥。密钥需与后端 <code>.env</code> 中的 <code>API_SECRET_KEY</code> 一致。</p>
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 12 }}>
+            <input
+              className="trade-input"
+              type="password"
+              value={apiKey}
+              onChange={e => setApiKey(e.target.value)}
+              placeholder="输入 API Secret Key"
+              style={{ flex: 1 }}
+            />
+            <button className="btn btn-primary" onClick={saveApiKey}>
+              {keySaved ? '已保存' : '保存'}
+            </button>
+          </div>
+          {apiKey && (
+            <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-muted)' }}>
+              当前已配置密钥（{apiKey.length}位），所有交易请求将自动携带
+            </div>
+          )}
         </div>
 
         {/* API 配置说明 */}

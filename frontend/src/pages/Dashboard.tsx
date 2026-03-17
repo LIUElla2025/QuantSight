@@ -2,6 +2,12 @@ import { useState, useEffect } from 'react'
 
 const API = 'http://localhost:8000'
 
+// API 认证：从 localStorage 读取密钥，POST/DELETE 请求自动携带
+function authHeaders(): Record<string, string> {
+  const key = localStorage.getItem('quantsight_api_key') || ''
+  return key ? { 'X-API-Key': key } : {}
+}
+
 export default function Dashboard() {
   const [accountData, setAccountData] = useState<any>(null)
   const [strategies, setStrategies] = useState<any[]>([])
@@ -69,7 +75,7 @@ export default function Dashboard() {
   const handleStart = () => {
     setActionLoading(true)
     setStatusMsg('')
-    fetch(`${API}/api/auto-trade/start`, { method: 'POST' })
+    fetch(`${API}/api/auto-trade/start`, { method: 'POST', headers: authHeaders() })
       .then(r => r.json())
       .then(d => {
         if (d.success) {
@@ -86,7 +92,7 @@ export default function Dashboard() {
 
   const handleStop = () => {
     setActionLoading(true)
-    fetch(`${API}/api/auto-trade/stop`, { method: 'POST' })
+    fetch(`${API}/api/auto-trade/stop`, { method: 'POST', headers: authHeaders() })
       .then(r => r.json())
       .then(d => {
         if (d.success) {
@@ -99,7 +105,7 @@ export default function Dashboard() {
   }
 
   const handleOptimize = () => {
-    fetch(`${API}/api/strategy/auto-optimize`, { method: 'POST' })
+    fetch(`${API}/api/strategy/auto-optimize`, { method: 'POST', headers: authHeaders() })
       .then(r => r.json())
       .then(d => {
         if (d.success) {
@@ -160,7 +166,7 @@ export default function Dashboard() {
               总亏损超过阈值，系统自动保护资金。请检查账户后手动重置。
             </div>
             <button className="btn btn-primary" onClick={() => {
-              fetch(`${API}/api/portfolio/reset-emergency`, { method: 'POST' }).then(() => refresh())
+              fetch(`${API}/api/portfolio/reset-emergency`, { method: 'POST', headers: authHeaders() }).then(() => refresh())
             }}>
               重置风控并重新启动
             </button>

@@ -2,12 +2,14 @@
 QuantSight - 量化交易自动化平台 API
 连接老虎证券 OpenAPI，支持自动化策略交易、回测、持仓管理
 """
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from typing import Optional
 import os
+import secrets
 import pandas as pd
 import logging
 
@@ -35,13 +37,31 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="QuantSight - 量化交易自动化平台")
 
+# ─── CORS 安全配置（只允许本地前端访问）───────────────
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ─── API 认证（保护交易接口）───────────────────────────
+API_SECRET_KEY = os.getenv("API_SECRET_KEY", "")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def verify_api_key(api_key: str = Depends(api_key_header)):
+    """验证 API Key — 所有交易相关接口必须携带"""
+    if not API_SECRET_KEY:
+        # 未配置密钥时，记录警告但允许访问（开发模式）
+        logger.warning("⚠️ API_SECRET_KEY 未配置! 交易接口无认证保护，请在 .env 中设置")
+        return True
+    if not api_key or not secrets.compare_digest(api_key, API_SECRET_KEY):
+        raise HTTPException(status_code=403, detail="无效的 API Key")
+    return True
+
 
 # ─── 老虎证券配置 ───────────────────────────────────
 TIGER_ID = os.getenv("TIGER_ID")
@@ -233,7 +253,7 @@ def get_klines(symbol: str, days: int = 100):
 #  下单交易 API
 # ═══════════════════════════════════════════════════
 
-@app.post("/api/order")
+@app.post("/api/order", dependencies=[Depends(verify_api_key)])
 def place_order(req: OrderRequest):
     """手动下单（买入/卖出）"""
     try:
@@ -343,7 +363,7 @@ def get_available_strategies():
     return {"success": True, "data": list_strategies()}
 
 
-@app.post("/api/strategy/create")
+@app.post("/api/strategy/create", dependencies=[Depends(verify_api_key)])
 def create_strategy(req: StrategyCreateRequest):
     """创建策略实例"""
     try:
@@ -353,7 +373,7 @@ def create_strategy(req: StrategyCreateRequest):
         return {"success": False, "error": str(e)}
 
 
-@app.post("/api/strategy/{instance_id}/start")
+@app.post("/api/strategy/{instance_id}/start", dependencies=[Depends(verify_api_key)])
 def start_strategy(instance_id: str):
     """启动策略"""
     try:
@@ -363,7 +383,7 @@ def start_strategy(instance_id: str):
         return {"success": False, "error": str(e)}
 
 
-@app.post("/api/strategy/{instance_id}/stop")
+@app.post("/api/strategy/{instance_id}/stop", dependencies=[Depends(verify_api_key)])
 def stop_strategy(instance_id: str):
     """停止策略"""
     try:
@@ -373,7 +393,7 @@ def stop_strategy(instance_id: str):
         return {"success": False, "error": str(e)}
 
 
-@app.delete("/api/strategy/{instance_id}")
+@app.delete("/api/strategy/{instance_id}", dependencies=[Depends(verify_api_key)])
 def remove_strategy(instance_id: str):
     """删除策略实例"""
     try:
@@ -520,41 +540,47 @@ def screener_hk(top_n: int = 10):
         return {"success": False, "error": str(e)}
 
 
-@app.post("/api/auto-trade/start")
-def auto_trade_start():
+@app.post("/api/auto-trade/start", dependencies=[Depends(verify_api_key)])
+def auto_trade_start(top_n: int = 2):
     """
     一键启动自动交易 — 系统自动选择最优策略和港股标的
-    使用多因子融合策略（最稳健），默认交易腾讯(00700)
+    v3.1: 默认只跑 2 只股票，适合小资金账户（1万-5万 HKD）
+    top_n 参数可调：资金<2万建议1-2只，2-5万建议2-3只，5万+可选更多
     """
     try:
-        # ── 余额预检 ──
+        # ── 余额预检（根据余额自动调整标的数量）──
+        cash = 0
         try:
             trade_client = get_trade_client()
             accounts = trade_client.get_assets()
-            cash = 0
             for acc in accounts:
                 if hasattr(acc, 'summary') and acc.summary:
                     cash = getattr(acc.summary, 'cash', 0)
             if cash < 1000:
                 return {
                     "success": False,
-                    "error": f"账户余额不足（当前: ${cash:.2f}），请先充值到老虎证券账户。"
-                             f"建议最少充值 HKD 20,000 以上。"
+                    "error": f"账户余额不足（当前: HKD {cash:.2f}），请先充值。最少需要 HKD 3,000。"
                 }
         except Exception as e:
             logger.warning(f"余额预检失败（不影响启动）: {e}")
 
-        # ── 清除旧的已停止实例，避免重复 ──
-        # Bug10修复: 使用 remove_strategy() 而非直接 pop()，确保 _stop_flags/_threads 也被清理
+        # 根据资金量自动限制标的数量（安全上限）
+        if cash > 0:
+            # 每只股票至少分配 3000 HKD
+            max_by_cash = max(1, int(cash / 3000))
+            top_n = min(top_n, max_by_cash)
+            logger.info(f"账户余额 HKD {cash:.0f}，自动调整标的数量为 {top_n} 只")
+
+        # ── 清除旧的已停止实例，避免重复（保留有持仓的）──
         old_ids = [
             iid for iid, inst in strategy_engine.instances.items()
-            if inst.status != "running"
+            if inst.status != "running" and inst.position_qty == 0
         ]
         for iid in old_ids:
             strategy_engine.remove_strategy(iid)
 
         # ── 动态选股：按流动性从备选池筛选最优标的 ──
-        targets = _screen_hk_stocks(top_n=6)
+        targets = _screen_hk_stocks(top_n=top_n)
 
         created = []
         subscribed_symbols = []
@@ -600,7 +626,7 @@ def portfolio_summary():
     return {"success": True, "data": strategy_engine.get_portfolio_summary()}
 
 
-@app.post("/api/portfolio/reset-emergency")
+@app.post("/api/portfolio/reset-emergency", dependencies=[Depends(verify_api_key)])
 def reset_emergency():
     """重置紧急停止状态"""
     strategy_engine.reset_emergency()
@@ -613,7 +639,7 @@ def evaluate_strategies():
     return {"success": True, "data": strategy_engine.evaluate_strategies()}
 
 
-@app.post("/api/strategy/auto-optimize")
+@app.post("/api/strategy/auto-optimize", dependencies=[Depends(verify_api_key)])
 def auto_optimize():
     """自动淘汰差策略，用最佳策略替换"""
     result = strategy_engine.auto_optimize()
@@ -746,7 +772,7 @@ def hot_stocks():
         return {"success": False, "error": str(e)}
 
 
-@app.post("/api/auto-trade/stop")
+@app.post("/api/auto-trade/stop", dependencies=[Depends(verify_api_key)])
 def auto_trade_stop():
     """一键停止所有自动交易"""
     try:
@@ -918,6 +944,29 @@ def startup():
             logger.error(f"获取 {symbol} K线数据失败: {e}")
             return pd.DataFrame()
 
+    def _poll_fill_price(tc, order_id, timeout: float = 3.0) -> Optional[float]:
+        """提交订单后短暂轮询，尝试获取实际成交均价"""
+        import time
+        deadline = time.time() + timeout
+        oid = str(order_id)
+        while time.time() < deadline:
+            try:
+                orders = tc.get_orders(account=TIGER_ACCOUNT)
+                if orders:
+                    for o in orders:
+                        if str(getattr(o, 'order_id', '')) == oid:
+                            filled = getattr(o, 'filled_quantity', 0) or 0
+                            avg_price = getattr(o, 'avg_fill_price', 0) or 0
+                            status = str(getattr(o, 'status', ''))
+                            if filled > 0 and avg_price > 0:
+                                return float(avg_price)
+                            if 'FILLED' in status.upper() or 'CANCELLED' in status.upper():
+                                return float(avg_price) if avg_price > 0 else None
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return None
+
     def execute_order(symbol: str, action: str, qty: int, price: float,
                       order_type: str = "LMT") -> dict:
         """
@@ -992,7 +1041,15 @@ def startup():
             if hasattr(result, 'code') and result.code != 0:
                 raise RuntimeError(f"下单被拒: {getattr(result, 'message', str(result))}")
             logger.info(f"自动下单成功: 订单ID {result}")
-            return {"order_id": str(result), "status": "submitted"}
+
+            # 尝试获取实际成交价（轮询最多3秒）
+            avg_fill_price = _poll_fill_price(trade_client, result, timeout=3.0)
+            resp = {"order_id": str(result), "status": "submitted"}
+            if avg_fill_price and avg_fill_price > 0:
+                resp["avg_fill_price"] = avg_fill_price
+                resp["filled"] = True
+                logger.info(f"实际成交价: {avg_fill_price:.3f}（信号价{price:.3f}）")
+            return resp
         except Exception as e:
             logger.error(f"自动下单失败: {e}")
             raise
