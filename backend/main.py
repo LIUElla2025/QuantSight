@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from typing import Optional
 import os
 import secrets
+import time as _time
 import pandas as pd
 import logging
 import logging.handlers
@@ -51,6 +52,11 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+_SERVER_START = _time.monotonic()
+
+def _uptime() -> float:
+    return _time.monotonic() - _SERVER_START
 
 app = FastAPI(title="QuantSight - 量化交易自动化平台")
 
@@ -156,7 +162,7 @@ def read_root():
 
 @app.get("/api/health")
 def health_check():
-    """系统健康检查 — 检测Tiger API连接、推送客户端、策略引擎状态"""
+    """系统健康检查 — 实盘监控：Tiger API、策略状态、P&L、风控状态一览"""
     from push_client import price_cache as pc
     from engine import engine as eng
     try:
@@ -167,16 +173,48 @@ def health_check():
         except Exception:
             pass
 
+        # 策略级别详情
+        strategy_details = []
+        for inst in eng.instances.values():
+            strategy_details.append({
+                "id": inst.id,
+                "name": inst.strategy_name,
+                "symbol": inst.symbol,
+                "status": inst.status,
+                "position_qty": inst.position_qty,
+                "realized_pnl": round(inst.realized_pnl, 2),
+                "unrealized_pnl": round(inst.unrealized_pnl, 2),
+                "total_trades": inst.total_trades,
+                "consecutive_losses": inst.consecutive_losses,
+                "daily_pnl": round(inst.daily_pnl, 2),
+                "last_signal": inst.last_signal,
+                "last_check": inst.last_check,
+                "error_msg": inst.error_msg,
+            })
+
+        total_realized = sum(i.realized_pnl for i in eng.instances.values())
+        total_unrealized = sum(i.unrealized_pnl for i in eng.instances.values())
+        running = sum(1 for i in eng.instances.values() if i.status == "running")
+        errors = sum(1 for i in eng.instances.values() if i.status == "error")
+
         return {
             "status": "ok",
             "tiger_api": tiger_ok,
             "push_connected": pc.is_connected,
             "push_subscribed": len(pc._subscribed),
-            "strategies_running": sum(1 for i in eng.instances.values() if i.status == "running"),
+            "strategies_running": running,
+            "strategies_error": errors,
             "strategies_total": len(eng.instances),
+            "total_realized_pnl": round(total_realized, 2),
+            "total_unrealized_pnl": round(total_unrealized, 2),
+            "total_pnl": round(total_realized + total_unrealized, 2),
             "emergency_stopped": eng._emergency_stopped,
+            "daily_loss_paused": eng._daily_loss_paused,
+            "strategies": strategy_details,
+            "uptime_seconds": round(_uptime(), 1),
         }
     except Exception as e:
+        logger.error(f"健康检查失败: {e}")
         return {"status": "error", "error": str(e)}
 
 
