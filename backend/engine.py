@@ -342,7 +342,7 @@ class StrategyEngine:
 
         df = self._quote_fetcher(inst.symbol)
         if df is None or len(df) == 0:
-            inst.last_check = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            inst.last_check = _hk_now().strftime("%Y-%m-%d %H:%M:%S")
             inst.last_signal = "数据获取失败，等待重试"
             return
 
@@ -356,7 +356,7 @@ class StrategyEngine:
         cached_price = _price_cache.get_price(inst.symbol) if _price_cache else None
         current_price = cached_price if cached_price else df["close"].iloc[-1]
 
-        inst.last_check = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        inst.last_check = _hk_now().strftime("%Y-%m-%d %H:%M:%S")
         inst.last_signal = f"{signal.signal.value}: {signal.reason}"
 
         # 更新未实现盈亏和追踪止损最高价
@@ -947,6 +947,12 @@ class StrategyEngine:
                 if fill and fill > 0:
                     actual_price = float(fill)
                     logger.info(f"[{inst.strategy_name}] 使用实际成交价 {actual_price:.3f}（信号价 {signal.price:.3f}）")
+            # 警告：限价单可能未成交但引擎已按信号价记录仓位
+            if actual_price == signal.price and self._order_executor:
+                logger.warning(
+                    f"[{inst.strategy_name}] 买入 {inst.symbol} 未获取实际成交价，"
+                    f"使用信号价 {signal.price:.3f}（限价单可能仍在挂单中）"
+                )
             inst.position_qty = signal.quantity
             inst.position_cost = actual_price
             inst.highest_price_since_buy = actual_price  # 重置追踪止损

@@ -231,7 +231,7 @@ export default function Dashboard() {
           <div style={{ marginTop: 12, color: 'var(--text-muted)', fontSize: 13 }}>
             {isRunning
               ? '智能仓位 · 追踪止损 · 风控保护 · 盘中15秒/分钟级监控'
-              : '6只港股蓝筹 · 6种顶级策略 · 全自动风控'
+              : '港股蓝筹精选 · 顶级量化策略 · 全自动风控'
             }
           </div>
           {statusMsg && (
