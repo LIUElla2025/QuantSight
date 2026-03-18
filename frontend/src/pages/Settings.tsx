@@ -6,8 +6,15 @@ export default function Settings() {
   const [apiStatus, setApiStatus] = useState<string>('未检测')
   const [checking, setChecking] = useState(false)
 
-  // API Key 认证
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('quantsight_api_key') || '')
+  // API Key 认证 — 优先从环境变量自动注入，回退到 localStorage
+  const [apiKey, setApiKey] = useState(() => {
+    const envKey = import.meta.env.VITE_API_SECRET_KEY as string | undefined
+    if (envKey) {
+      localStorage.setItem('quantsight_api_key', envKey)
+      return envKey
+    }
+    return localStorage.getItem('quantsight_api_key') || ''
+  })
   const [keySaved, setKeySaved] = useState(false)
 
   const saveApiKey = () => {

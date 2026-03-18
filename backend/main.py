@@ -61,7 +61,7 @@ def _uptime() -> float:
 app = FastAPI(title="QuantSight - 量化交易自动化平台")
 
 # ─── CORS 安全配置（只允许本地前端访问）───────────────
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174").split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -88,8 +88,18 @@ async def verify_api_key(api_key: str = Depends(api_key_header)):
 
 # ─── 老虎证券配置 ───────────────────────────────────
 TIGER_ID = os.getenv("TIGER_ID")
-TIGER_ACCOUNT = os.getenv("TIGER_ACCOUNT")
 TIGER_PRIVATE_KEY = os.getenv("TIGER_PRIVATE_KEY")
+
+# ─── 模拟/实盘切换 ────────────────────────────────────
+# PAPER_TRADING=true → 老虎模拟盘账号，安全练手
+# PAPER_TRADING=false → 实盘账号，真金白银
+PAPER_TRADING = os.getenv("PAPER_TRADING", "false").lower() == "true"
+if PAPER_TRADING:
+    TIGER_ACCOUNT = os.getenv("TIGER_PAPER_ACCOUNT")
+    logger.warning(f"⚠️  模拟盘模式 — 账号: {TIGER_ACCOUNT}，不会动真实资金")
+else:
+    TIGER_ACCOUNT = os.getenv("TIGER_ACCOUNT")
+    logger.warning(f"🔴 实盘模式 — 账号: {TIGER_ACCOUNT}，真实资金交易")
 
 
 def get_tiger_config():
@@ -99,6 +109,8 @@ def get_tiger_config():
     config.tiger_id = TIGER_ID
     config.account = TIGER_ACCOUNT
     config.private_key = TIGER_PRIVATE_KEY.replace('\\n', '\n')
+    if PAPER_TRADING:
+        config.is_paper = True
     return config
 
 
@@ -222,25 +234,66 @@ def health_check():
 #  账户 API
 # ═══════════════════════════════════════════════════
 
+def _safe_float(v, default=0.0) -> float:
+    """把 inf/nan 转成 0，避免 JSON 序列化失败"""
+    import math
+    try:
+        f = float(v) if v is not None else default
+        return default if math.isinf(f) or math.isnan(f) else f
+    except (TypeError, ValueError):
+        return default
+
+
 @app.get("/api/account")
 def get_account_info():
-    """获取账户资产信息"""
+    """获取账户资产信息（直接读取各货币真实余额）"""
     try:
         trade_client = get_trade_client()
-        accounts = trade_client.get_assets()
+        accounts = trade_client.get_assets(market_value=True)
         base_info = []
         for acc in accounts:
-            if hasattr(acc, 'summary') and acc.summary:
+            mvs = getattr(acc, 'market_values', {})
+            if mvs:
+                # 直接用各币种真实余额，不做汇率换算
+                for currency, mv in mvs.items():
+                    cash = _safe_float(getattr(mv, 'cash_balance', 0))
+                    net_liq = _safe_float(getattr(mv, 'net_liquidation', 0))
+                    if abs(cash) < 0.01 and abs(net_liq) < 0.01:
+                        continue  # 跳过零余额货币
+                    base_info.append({
+                        "currency": currency,
+                        "equity": round(net_liq, 2),
+                        "available_funds": round(cash, 2),
+                        "unrealized_pnl": round(_safe_float(getattr(mv, 'unrealized_pnl', 0)), 2),
+                        "realized_pnl": round(_safe_float(getattr(mv, 'realized_pnl', 0)), 2),
+                        "buying_power": round(cash, 2),
+                        "net_liquidation": round(net_liq, 2),
+                        "cash": round(cash, 2),
+                    })
+            elif hasattr(acc, 'summary') and acc.summary:
+                # 降级：market_values 不可用时（模拟盘走这条路）
                 s = acc.summary
+                currency = getattr(s, 'currency', 'USD')
+                raw_nliq = _safe_float(getattr(s, 'net_liquidation', 0))
+                raw_equity = _safe_float(getattr(s, 'equity_with_loan', 0))
+                raw_cash = _safe_float(getattr(s, 'cash', 0))
+                raw_bp = _safe_float(getattr(s, 'buying_power', 0))
+                # 模拟盘：直接用原始 USD 数值，不换算
+                # 实盘：USD summary → ×7.84 换成 HKD（market_values 有数据时不走这路）
+                if PAPER_TRADING:
+                    fx, display_currency = 1.0, currency
+                else:
+                    fx, display_currency = 7.84, "HKD"
+                equity_val = round((raw_equity if raw_equity > 0 else raw_nliq) * fx, 2)
                 base_info.append({
-                    "currency": getattr(s, 'currency', 'USD'),
-                    "equity": getattr(s, 'equity_with_loan', 0),
-                    "available_funds": getattr(s, 'available_funds', 0),
-                    "unrealized_pnl": getattr(s, 'unrealized_pnl', 0),
-                    "realized_pnl": getattr(s, 'realized_pnl', 0),
-                    "buying_power": getattr(s, 'buying_power', 0),
-                    "net_liquidation": getattr(s, 'net_liquidation', 0),
-                    "cash": getattr(s, 'cash', 0),
+                    "currency": display_currency,
+                    "equity": equity_val,
+                    "available_funds": round(raw_cash * fx, 2),
+                    "unrealized_pnl": round(_safe_float(getattr(s, 'unrealized_pnl', 0)) * fx, 2),
+                    "realized_pnl": round(_safe_float(getattr(s, 'realized_pnl', 0)) * fx, 2),
+                    "buying_power": round(raw_bp * fx, 2),
+                    "net_liquidation": round(raw_nliq * fx, 2),
+                    "cash": round(raw_cash * fx, 2),
                 })
         return {"success": True, "data": base_info}
     except Exception as e:
@@ -515,13 +568,11 @@ def run_backtest(req: BacktestRequest):
 
 def _screen_hk_stocks(top_n: int = 6) -> list[dict]:
     """
-    用老虎行情接口筛选港股蓝筹 v2.0：
-    - 候选池从10扩展到20只（恒生指数成分股+科技龙头+消费+医疗）
-    - 筛选标准：按成交额排序（流动性），只选流动性最好的top_n只
-    - 每只股票分配最适合其特性的策略
-    - 失败时返回默认标的
+    选股 v2.1：
+    - 实盘：港股蓝筹20只
+    - 模拟盘（PAPER_TRADING=true）：港股+美股共30只，资金充足可多元配置
     """
-    # 候选池（20只）：恒生指数核心 + 各行业龙头
+    # 港股候选池（20只）
     candidates = [
         # 科技/互联网
         {"symbol": "00700", "strategy": "super_alpha",         "name": "腾讯控股",   "sector": "tech"},
@@ -550,6 +601,22 @@ def _screen_hk_stocks(top_n: int = 6) -> list[dict]:
         # 医疗
         {"symbol": "01177", "strategy": "super_alpha",         "name": "中国生物制药","sector": "health"},
     ]
+
+    # 模拟盘：追加美股候选（标普500核心 + AI科技）
+    if PAPER_TRADING:
+        candidates += [
+            {"symbol": "NVDA",  "strategy": "momentum_volatility", "name": "英伟达",     "sector": "tech"},
+            {"symbol": "AAPL",  "strategy": "regime_adaptive",     "name": "苹果",       "sector": "tech"},
+            {"symbol": "MSFT",  "strategy": "multi_factor",        "name": "微软",       "sector": "tech"},
+            {"symbol": "TSLA",  "strategy": "momentum_volatility", "name": "特斯拉",     "sector": "auto"},
+            {"symbol": "META",  "strategy": "super_alpha",         "name": "Meta",       "sector": "tech"},
+            {"symbol": "GOOGL", "strategy": "regime_adaptive",     "name": "谷歌",       "sector": "tech"},
+            {"symbol": "AMZN",  "strategy": "trend_tail_hedge",    "name": "亚马逊",     "sector": "tech"},
+            {"symbol": "BABA",  "strategy": "mean_reversion",      "name": "阿里美股",   "sector": "tech"},
+            {"symbol": "SPY",   "strategy": "macd",                "name": "标普ETF",    "sector": "etf"},
+            {"symbol": "QQQ",   "strategy": "momentum_volatility", "name": "纳指ETF",    "sector": "etf"},
+        ]
+
     try:
         quote_client = get_quote_client()
         symbols = [c["symbol"] for c in candidates]
@@ -603,28 +670,45 @@ def auto_trade_start(top_n: int = 2):
     top_n 参数可调：资金<2万建议1-2只，2-5万建议2-3只，5万+可选更多
     """
     try:
-        # ── 余额预检（根据余额自动调整标的数量）──
+        # ── 余额预检 ──
         cash = 0
         try:
             trade_client = get_trade_client()
-            accounts = trade_client.get_assets()
+            accounts = trade_client.get_assets(market_value=True)
             for acc in accounts:
-                if hasattr(acc, 'summary') and acc.summary:
-                    cash = getattr(acc.summary, 'cash', 0)
-            if cash < 1000:
+                mvs = getattr(acc, 'market_values', {})
+                hkd = mvs.get('HKD')
+                if hkd:
+                    cash = getattr(hkd, 'cash_balance', 0)
+                elif hasattr(acc, 'summary') and acc.summary:
+                    s = acc.summary
+                    raw = _safe_float(getattr(s, 'cash', 0))
+                    # 模拟盘：用buying_power（支持融资），实盘：cash换算HKD
+                    if PAPER_TRADING:
+                        cash = _safe_float(getattr(s, 'buying_power', raw))
+                    else:
+                        cash = raw * 7.84
+            if cash < 100:
                 return {
                     "success": False,
-                    "error": f"账户余额不足（当前: HKD {cash:.2f}），请先充值。最少需要 HKD 3,000。"
+                    "error": f"账户余额不足（当前: {cash:.2f}），请先充值。"
                 }
         except Exception as e:
             logger.warning(f"余额预检失败（不影响启动）: {e}")
 
-        # 根据资金量自动限制标的数量（安全上限）
+        # 根据资金量自动限制标的数量
         if cash > 0:
-            # 每只股票至少分配 3000 HKD
-            max_by_cash = max(1, int(cash / 3000))
-            top_n = min(top_n, max_by_cash)
-            logger.info(f"账户余额 HKD {cash:.0f}，自动调整标的数量为 {top_n} 只")
+            if PAPER_TRADING:
+                # 模拟盘资金充足，不限制数量，直接用传入的 top_n
+                logger.info(f"模拟盘余额 {cash:.0f}，top_n={top_n} 只")
+            elif cash < 15000:
+                # 实盘小资金：港股蓝筹1手最少6000 HKD，强制单只
+                top_n = 1
+                logger.info(f"实盘小资金({cash:.0f}HKD<15000)，强制top_n=1")
+            else:
+                max_by_cash = max(1, int(cash / 8000))
+                top_n = min(top_n, max_by_cash)
+                logger.info(f"实盘余额 HKD {cash:.0f}，top_n={top_n} 只")
 
         # ── 清除旧的已停止实例，避免重复（保留有持仓的）──
         old_ids = [
@@ -635,39 +719,50 @@ def auto_trade_start(top_n: int = 2):
             strategy_engine.remove_strategy(iid)
 
         # ── 动态选股：按流动性从备选池筛选最优标的 ──
-        # 小资金需要更多候选，因为很多1手价超预算会被过滤
-        fetch_n = top_n * 5 if cash < 30000 else top_n
+        fetch_n = min(20, top_n * 10)   # 拉满候选，保证小资金也能找到可负担的
         raw_targets = _screen_hk_stocks(top_n=fetch_n)
 
-        # 小资金过滤：只保留单手价在预算内的标的
-        per_stock_budget = cash / max(top_n, 1) * 0.9 if cash > 0 else 5000
-        targets = []
-        for t in raw_targets:
-            sym = t["symbol"]
-            lot = strategy_engine._get_hk_lot_size(sym)
-            # 用候选池中的价格估算（如果有的话），否则跳过检查
-            est_price = t.get("amount", 0) / max(t.get("_score", 1), 1) if t.get("_score") else 0
-            if cash > 0 and cash < 30000 and est_price == 0:
-                # 无法估价时，用Tiger API快速查价
+        # 可负担性过滤：用Tiger API获取真实价格，过滤掉1手超出预算的股票
+        # 模拟盘有400万USD buying_power，无需过滤
+        if PAPER_TRADING:
+            targets = raw_targets[:top_n]
+            logger.info(f"模拟盘模式，跳过可负担性过滤，直接选取前{top_n}只: {[t['symbol'] for t in targets]}")
+        else:
+            per_stock_budget = cash / max(top_n, 1) * 0.9 if cash > 0 else 5000
+            targets = []
+            if cash > 0:
+                # 批量查价（一次请求，不逐个查）
+                all_syms = [t["symbol"] for t in raw_targets]
+                price_map: dict[str, float] = {}
                 try:
                     qc = get_quote_client()
-                    briefs = qc.get_stock_briefs([sym])
-                    if briefs is not None and len(briefs) > 0 and hasattr(briefs, 'iloc'):
-                        est_price = float(briefs.iloc[0].get('latest_price', 0) or 0)
-                except Exception:
-                    pass
-            lot_cost = est_price * lot if est_price > 0 else 0
-            if lot_cost > 0 and lot_cost > per_stock_budget:
-                logger.info(f"选股过滤: {t['name']}({sym}) 1手={lot_cost:.0f}HKD > 预算{per_stock_budget:.0f}HKD，跳过")
-                continue
-            targets.append(t)
-            if len(targets) >= top_n:
-                break
+                    briefs = qc.get_briefs(all_syms, include_hour_trading=False)
+                    for q in briefs:
+                        p = getattr(q, 'latest_price', 0) or getattr(q, 'pre_close', 0)
+                        if p:
+                            price_map[q.symbol] = float(p)
+                except Exception as e:
+                    logger.warning(f"批量查价失败，跳过可负担性过滤: {e}")
+
+                for t in raw_targets:
+                    sym = t["symbol"]
+                    lot = strategy_engine._get_hk_lot_size(sym)
+                    price = price_map.get(sym, 0)
+                    lot_cost = price * lot if price > 0 else 0
+                    if lot_cost > 0 and lot_cost > per_stock_budget:
+                        logger.info(f"选股过滤: {t['name']}({sym}) 1手={lot_cost:.0f}HKD > 预算{per_stock_budget:.0f}HKD，跳过")
+                        continue
+                    targets.append(t)
+                    if len(targets) >= top_n:
+                        break
+            else:
+                targets = raw_targets[:top_n]
 
         if not targets:
+            err_msg = "模拟盘选股为空，请检查选股逻辑" if PAPER_TRADING else f"账户余额 HKD {cash:.0f} 不足以买入任何候选股的最小1手（预算{per_stock_budget:.0f}HKD），请充值"
             return {
                 "success": False,
-                "error": f"账户余额 HKD {cash:.0f} 不足以买入任何候选股的最小1手，请充值"
+                "error": err_msg
             }
 
         created = []
@@ -1143,18 +1238,38 @@ def startup():
             raise
 
     def fetch_account() -> dict:
-        """获取账户余额供引擎智能仓位使用"""
+        """获取账户HKD余额供引擎使用（直接读真实港币余额）"""
         try:
             trade_client = get_trade_client()
-            accounts = trade_client.get_assets()
+            accounts = trade_client.get_assets(market_value=True)
             for acc in accounts:
+                mvs = getattr(acc, 'market_values', {})
+                hkd = mvs.get('HKD')
+                if hkd:
+                    cash = getattr(hkd, 'cash_balance', 0)
+                    equity = getattr(hkd, 'net_liquidation', 0)
+                    logger.info(f"账户HKD余额(直接读取): cash={cash:.0f} equity={equity:.0f}")
+                    return {"equity": equity, "cash": cash, "buying_power": cash}
+                # 降级：无 market_values 时（模拟盘走这条路）
                 if hasattr(acc, 'summary') and acc.summary:
                     s = acc.summary
-                    return {
-                        "equity": getattr(s, 'equity_with_loan', 0),
-                        "cash": getattr(s, 'cash', 0),
-                        "buying_power": getattr(s, 'buying_power', 0),
-                    }
+                    raw_cash = _safe_float(getattr(s, 'cash', 0))
+                    raw_bp = _safe_float(getattr(s, 'buying_power', 0))
+                    raw_equity = _safe_float(getattr(s, 'equity_with_loan', 0))
+                    raw_nliq = _safe_float(getattr(s, 'net_liquidation', 0))
+                    if PAPER_TRADING:
+                        # 模拟盘：直接用 USD 原始值，用 buying_power 做预算（支持融资）
+                        equity = raw_equity if raw_equity > 0 else raw_nliq
+                        cash = raw_cash
+                        bp = raw_bp
+                        logger.info(f"模拟盘余额(USD原值): cash={cash:.0f} equity={equity:.0f} buying_power={bp:.0f}")
+                        return {"equity": equity, "cash": bp, "buying_power": bp}  # 用bp做预算
+                    else:
+                        # 实盘：USD → HKD
+                        equity = (raw_equity if raw_equity > 0 else raw_nliq) * 7.84
+                        cash = raw_cash * 7.84
+                        logger.info(f"实盘余额(USD→HKD×7.84): cash={cash:.0f} equity={equity:.0f}")
+                        return {"equity": equity, "cash": cash, "buying_power": cash}
             return {"equity": 0, "cash": 0, "buying_power": 0}
         except Exception as e:
             logger.error(f"获取账户信息失败: {e}")

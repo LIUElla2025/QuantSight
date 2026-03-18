@@ -49,10 +49,11 @@ class RealTimePriceCache:
         """内部连接逻辑，供setup和重连调用"""
         try:
             from tigeropen.push.push_client import PushClient
-            self._push_client = PushClient(self._config, use_full_tick=False)
+            _, host, port = self._config.socket_host_port
+            self._push_client = PushClient(host, port, use_ssl=True, client_config=self._config)
             self._push_client.quote_changed = self._on_quote_changed
             self._push_client.disconnect_callback = self._on_disconnect
-            self._push_client.connect(timeout=10)
+            self._push_client.connect(self._config.tiger_id, self._config.private_key)
             self._connected = True
             logger.info("Tiger 实时推送客户端连接成功")
             # 重连后重新订阅之前的标的
